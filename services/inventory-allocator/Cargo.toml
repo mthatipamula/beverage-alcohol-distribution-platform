@@ -1,0 +1,26 @@
+[package]
+name = "inventory-allocator"
+version = "1.0.0"
+edition = "2021"
+description = "Kafka consumer that reserves inventory for validated orders from in-state warehouses"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+deadpool-postgres = "0.14"
+rdkafka = { version = "0.37", features = ["cmake-build", "ssl-vendored", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1", "with-chrono-0_4"] }
+tokio-postgres-rustls = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

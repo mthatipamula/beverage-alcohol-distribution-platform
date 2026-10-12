@@ -1,0 +1,20 @@
+# Dependencies and builds
+node_modules/
+dist/
+target/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local runtime
+.run/
+data/
+.env
+aws/deploy/.outputs.env
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+.claude/

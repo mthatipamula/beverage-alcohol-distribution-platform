@@ -1,0 +1,428 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Beverage Alcohol Distribution Platform - shared infrastructure: VPC, RDS PostgreSQL, Amazon MSK (Kafka),
+  Cognito, ECS cluster, internal Application Load Balancer, API Gateway HTTP API and the depletion feeds bucket.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: bevdist
+    AllowedPattern: "^[a-z][a-z0-9-]{2,20}$"
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  KafkaInstanceType:
+    Type: String
+    Default: kafka.t3.small
+  KafkaVersion:
+    Type: String
+    Default: 3.6.0
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  # Two AZs. Public subnets hold the ECS tasks (public IPs for pulling images, no NAT gateway cost; the
+  # security group only admits the load balancer). Private subnets hold RDS, MSK, the ALB and the VPC link.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref ProjectName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-a" }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-b" }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-a" }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  # ---------------------------------------------------------------- Security groups
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC link
+      VpcId: !Ref Vpc
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal load balancer, reachable only from the API Gateway VPC link
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref VpcLinkSecurityGroup }
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS services, reachable only from the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL, reachable only from the services
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref ServiceSecurityGroup }
+  KafkaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MSK brokers (SASL/SCRAM over TLS), reachable only from the services
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 9096, ToPort: 9096, SourceSecurityGroupId: !Ref ServiceSecurityGroup }
+
+  # ---------------------------------------------------------------- PostgreSQL (RDS)
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete          # demo project; use Snapshot for real data
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-db"
+      Engine: postgres
+      DBInstanceClass: !Ref DbInstanceClass
+      DBName: bevdist
+      MasterUsername: bevdist
+      ManageMasterUserPassword: true   # password generated and rotated in Secrets Manager
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      DeletionProtection: false
+
+  # ---------------------------------------------------------------- Kafka (Amazon MSK)
+  # SASL/SCRAM credentials must live in a secret named AmazonMSK_* encrypted with a customer-managed key.
+  KafkaSecretKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the MSK SASL/SCRAM secret
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+  KafkaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "AmazonMSK_${ProjectName}"
+      KmsKeyId: !Ref KafkaSecretKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "bevdist"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+  KafkaConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Name: !Sub "${ProjectName}-kafka"
+      KafkaVersionsList: [!Ref KafkaVersion]
+      ServerProperties: |
+        auto.create.topics.enable=false
+        default.replication.factor=2
+        min.insync.replicas=1
+        num.partitions=3
+  KafkaCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-kafka"
+      KafkaVersion: !Ref KafkaVersion
+      NumberOfBrokerNodes: 2
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref KafkaInstanceType
+        ClientSubnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroups: [!Ref KafkaSecurityGroup]
+        StorageInfo: { EBSStorageInfo: { VolumeSize: 10 } }
+      ClientAuthentication:
+        Sasl: { Scram: { Enabled: true } }
+        Unauthenticated: { Enabled: false }
+      EncryptionInfo:
+        EncryptionInTransit: { ClientBroker: TLS, InCluster: true }
+      ConfigurationInfo:
+        Arn: !GetAtt KafkaConfiguration.Arn
+        Revision: 1
+  KafkaScramSecret:
+    Type: AWS::MSK::BatchScramSecret
+    Properties:
+      ClusterArn: !Ref KafkaCluster
+      SecretArnList: [!Ref KafkaSecret]
+
+  # ---------------------------------------------------------------- Sign-in (Cognito)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+      Policies:
+        PasswordPolicy: { MinimumLength: 12, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: false }
+      Schema:
+        - { Name: account_id, AttributeDataType: String, Mutable: true }   # retail users: their account
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${ProjectName}-api"
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      TokenValidityUnits: { IdToken: minutes, AccessToken: minutes }
+      PreventUserExistenceErrors: ENABLED
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: admin, Description: Operations administrators }
+  SalesRepGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: sales_rep, Description: Sales reps (may apply discounts) }
+  RetailerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: retailer, Description: Retail account users (own account only) }
+
+  # ---------------------------------------------------------------- Compute and routing
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties: { ClusterName: !Ref ProjectName }
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-internal"
+      Scheme: internal
+      Type: application
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: { StatusCode: "404", ContentType: application/json, MessageBody: '{"status":404}' }
+
+  # Public entry point: Cognito JWT checked at the edge, then a private VPC link to the internal ALB.
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub "${ProjectName}-vpc-link"
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcLinkSecurityGroup]
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref Listener
+      PayloadFormatVersion: "1.0"
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: cognito
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+  ProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${Integration}"
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /health"
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${Integration}"
+  DocsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /docs/{proxy+}"
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${Integration}"
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings: { ThrottlingBurstLimit: 100, ThrottlingRateLimit: 50 }
+
+  # ---------------------------------------------------------------- Storage and IAM
+  FeedsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-depletion-feeds-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      LifecycleConfiguration:
+        Rules: [{ Id: expire-old-feeds, Status: Enabled, ExpirationInDays: 400 }]
+
+  # Used by ECS to pull images, write logs and inject secrets into containers.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!GetAtt Database.MasterUserSecret.SecretArn, !Ref KafkaSecret]
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt KafkaSecretKey.Arn
+  # Used by the running containers (only the compliance service writes feeds).
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: write-depletion-feeds
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${FeedsBucket.Arn}/depletions/*"
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  PublicSubnets:
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnets" }
+  ServiceSecurityGroup:
+    Value: !Ref ServiceSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-ServiceSecurityGroup" }
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${AWS::StackName}-Cluster" }
+  ListenerArn:
+    Value: !Ref Listener
+    Export: { Name: !Sub "${AWS::StackName}-Listener" }
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ExecutionRole" }
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-TaskRole" }
+  DbHost:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-DbHost" }
+  DbSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub "${AWS::StackName}-DbSecret" }
+  KafkaClusterArn:
+    Value: !Ref KafkaCluster
+  KafkaSecretArn:
+    Value: !Ref KafkaSecret
+    Export: { Name: !Sub "${AWS::StackName}-KafkaSecret" }
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export: { Name: !Sub "${AWS::StackName}-UserPoolClient" }
+  CognitoIssuer:
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+    Export: { Name: !Sub "${AWS::StackName}-CognitoIssuer" }
+  FeedsBucket:
+    Value: !Ref FeedsBucket
+    Export: { Name: !Sub "${AWS::StackName}-FeedsBucket" }
