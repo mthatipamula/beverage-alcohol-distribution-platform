@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Beverage Alcohol Distribution Platform - ECS Fargate services (order-api, compliance-service,
+  inventory-allocator) behind the internal load balancer from the infrastructure stack.
+
+Parameters:
+  InfraStackName:
+    Type: String
+    Default: bevdist-infra
+  ImageRegistry:
+    Type: String
+    Description: ECR registry and prefix, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/bevdist
+  ImageTag:
+    Type: String
+  KafkaBootstrapBrokers:
+    Type: String
+    Description: MSK SASL/SCRAM bootstrap brokers (port 9096), looked up by 03-deploy.sh
+  SeedDemoData:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+Resources:
+  # ---------------------------------------------------------------- order-api (Node.js)
+  OrderApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /bevdist/order-api, RetentionInDays: 14 }
+  OrderApiTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: bevdist-order-api
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${InfraStackName}-ExecutionRole" }
+      TaskRoleArn: { "Fn::ImportValue": !Sub "${InfraStackName}-TaskRole" }
+      ContainerDefinitions:
+        - Name: order-api
+          Image: !Sub "${ImageRegistry}/order-api:${ImageTag}"
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080 }]
+          Environment:
+            - { Name: DB_HOST, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-DbHost" } }
+            - { Name: DB_PORT, Value: "5432" }
+            - { Name: DB_NAME, Value: bevdist }
+            - { Name: DB_SSL_CA, Value: /etc/ssl/rds-global-bundle.pem }
+            - { Name: KAFKA_BROKERS, Value: !Ref KafkaBootstrapBrokers }
+            - { Name: KAFKA_TOPIC_PARTITIONS, Value: "3" }
+            - { Name: KAFKA_REPLICATION_FACTOR, Value: "2" }
+            - { Name: AUTH_MODE, Value: jwt }
+            - { Name: COGNITO_ISSUER, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-CognitoIssuer" } }
+            - { Name: COGNITO_CLIENT_ID, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-UserPoolClient" } }
+            - { Name: SEED_DEMO_DATA, Value: !Ref SeedDemoData }
+          Secrets:
+            - { Name: DB_USER, ValueFrom: !Sub ["${Arn}:username::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-DbSecret" } }] }
+            - { Name: DB_PASSWORD, ValueFrom: !Sub ["${Arn}:password::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-DbSecret" } }] }
+            - { Name: KAFKA_SASL_USERNAME, ValueFrom: !Sub ["${Arn}:username::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-KafkaSecret" } }] }
+            - { Name: KAFKA_SASL_PASSWORD, ValueFrom: !Sub ["${Arn}:password::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-KafkaSecret" } }] }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref OrderApiLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: order-api }
+  OrderApiTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: { "Fn::ImportValue": !Sub "${InfraStackName}-VpcId" }
+      HealthCheckPath: /health
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "15" }]
+  OrderApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: { "Fn::ImportValue": !Sub "${InfraStackName}-Listener" }
+      Priority: 100
+      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/*"] } }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref OrderApiTargets }]
+  OrderApiService:
+    Type: AWS::ECS::Service
+    DependsOn: OrderApiRule
+    Properties:
+      ServiceName: order-api
+      Cluster: { "Fn::ImportValue": !Sub "${InfraStackName}-Cluster" }
+      TaskDefinition: !Ref OrderApiTask
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 90
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${InfraStackName}-PublicSubnets" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${InfraStackName}-ServiceSecurityGroup" }]
+      LoadBalancers: [{ ContainerName: order-api, ContainerPort: 8080, TargetGroupArn: !Ref OrderApiTargets }]
+
+  # ---------------------------------------------------------------- compliance-service (Python)
+  ComplianceLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /bevdist/compliance-service, RetentionInDays: 14 }
+  ComplianceTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: bevdist-compliance-service
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${InfraStackName}-ExecutionRole" }
+      TaskRoleArn: { "Fn::ImportValue": !Sub "${InfraStackName}-TaskRole" }
+      ContainerDefinitions:
+        - Name: compliance-service
+          Image: !Sub "${ImageRegistry}/compliance-service:${ImageTag}"
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080 }]
+          Environment:
+            - { Name: DB_HOST, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-DbHost" } }
+            - { Name: DB_PORT, Value: "5432" }
+            - { Name: DB_NAME, Value: bevdist }
+            - { Name: DB_SSL_CA, Value: /etc/ssl/rds-global-bundle.pem }
+            - { Name: KAFKA_BROKERS, Value: !Ref KafkaBootstrapBrokers }
+            - { Name: AUTH_MODE, Value: jwt }
+            - { Name: COGNITO_ISSUER, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-CognitoIssuer" } }
+            - { Name: COGNITO_CLIENT_ID, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-UserPoolClient" } }
+            - { Name: SEED_DEMO_DATA, Value: !Ref SeedDemoData }
+            - { Name: FEEDS_BUCKET, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-FeedsBucket" } }
+          Secrets:
+            - { Name: DB_USER, ValueFrom: !Sub ["${Arn}:username::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-DbSecret" } }] }
+            - { Name: DB_PASSWORD, ValueFrom: !Sub ["${Arn}:password::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-DbSecret" } }] }
+            - { Name: KAFKA_SASL_USERNAME, ValueFrom: !Sub ["${Arn}:username::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-KafkaSecret" } }] }
+            - { Name: KAFKA_SASL_PASSWORD, ValueFrom: !Sub ["${Arn}:password::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-KafkaSecret" } }] }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref ComplianceLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: compliance }
+  ComplianceTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: { "Fn::ImportValue": !Sub "${InfraStackName}-VpcId" }
+      HealthCheckPath: /health
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "15" }]
+  ComplianceRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: { "Fn::ImportValue": !Sub "${InfraStackName}-Listener" }
+      Priority: 10
+      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/v1/compliance/*", "/v1/depletions/*"] } }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref ComplianceTargets }]
+  ComplianceService:
+    Type: AWS::ECS::Service
+    DependsOn: [ComplianceRule, OrderApiService]   # order-api creates the Kafka topics first
+    Properties:
+      ServiceName: compliance-service
+      Cluster: { "Fn::ImportValue": !Sub "${InfraStackName}-Cluster" }
+      TaskDefinition: !Ref ComplianceTask
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 90
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${InfraStackName}-PublicSubnets" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${InfraStackName}-ServiceSecurityGroup" }]
+      LoadBalancers: [{ ContainerName: compliance-service, ContainerPort: 8080, TargetGroupArn: !Ref ComplianceTargets }]
+
+  # ---------------------------------------------------------------- inventory-allocator (Rust)
+  AllocatorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /bevdist/inventory-allocator, RetentionInDays: 14 }
+  AllocatorTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: bevdist-inventory-allocator
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${InfraStackName}-ExecutionRole" }
+      ContainerDefinitions:
+        - Name: inventory-allocator
+          Image: !Sub "${ImageRegistry}/inventory-allocator:${ImageTag}"
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080 }]
+          Environment:
+            - { Name: DB_HOST, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-DbHost" } }
+            - { Name: DB_PORT, Value: "5432" }
+            - { Name: DB_NAME, Value: bevdist }
+            - { Name: DB_SSL_CA, Value: /etc/ssl/rds-global-bundle.pem }
+            - { Name: KAFKA_BROKERS, Value: !Ref KafkaBootstrapBrokers }
+            - { Name: AUTH_MODE, Value: jwt }
+            - { Name: SEED_DEMO_DATA, Value: !Ref SeedDemoData }
+            - { Name: RUST_LOG, Value: info }
+          Secrets:
+            - { Name: DB_USER, ValueFrom: !Sub ["${Arn}:username::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-DbSecret" } }] }
+            - { Name: DB_PASSWORD, ValueFrom: !Sub ["${Arn}:password::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-DbSecret" } }] }
+            - { Name: KAFKA_SASL_USERNAME, ValueFrom: !Sub ["${Arn}:username::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-KafkaSecret" } }] }
+            - { Name: KAFKA_SASL_PASSWORD, ValueFrom: !Sub ["${Arn}:password::", { Arn: { "Fn::ImportValue": !Sub "${InfraStackName}-KafkaSecret" } }] }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref AllocatorLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: allocator }
+  AllocatorTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: { "Fn::ImportValue": !Sub "${InfraStackName}-VpcId" }
+      HealthCheckPath: /health
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "15" }]
+  AllocatorRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: { "Fn::ImportValue": !Sub "${InfraStackName}-Listener" }
+      Priority: 20
+      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/v1/inventory", "/v1/inventory/*"] } }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref AllocatorTargets }]
+  AllocatorService:
+    Type: AWS::ECS::Service
+    DependsOn: [AllocatorRule, OrderApiService]
+    Properties:
+      ServiceName: inventory-allocator
+      Cluster: { "Fn::ImportValue": !Sub "${InfraStackName}-Cluster" }
+      TaskDefinition: !Ref AllocatorTask
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 90
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${InfraStackName}-PublicSubnets" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${InfraStackName}-ServiceSecurityGroup" }]
+      LoadBalancers: [{ ContainerName: inventory-allocator, ContainerPort: 8080, TargetGroupArn: !Ref AllocatorTargets }]
