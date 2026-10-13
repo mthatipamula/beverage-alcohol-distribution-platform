@@ -1,6 +1,6 @@
--- Demo data (fictional accounts, brands and suppliers). Loaded only when SEED_DEMO_DATA=true and the
--- catalog is empty. Account IDs, SKUs and the price formula are shared with the compliance and inventory
--- services so the demo data lines up across services.
+-- Demo data. Retail accounts are fictional. Brand names are real products used for illustration only;
+-- prices and costs are illustrative, not actual wholesale prices. SKUs and the price formula are shared with
+-- the compliance and inventory services so the demo data lines up across services.
 INSERT INTO orders.accounts (id, name, state, channel) VALUES
     ('ACC-FL-1001', 'Bayside Liquors',          'FL', 'OFF_PREMISE'),
     ('ACC-FL-1002', 'Ocean Grill',              'FL', 'ON_PREMISE'),
@@ -11,19 +11,37 @@ INSERT INTO orders.accounts (id, name, state, channel) VALUES
     ('ACC-GA-5001', 'Peach State Package Store','GA', 'OFF_PREMISE')
 ON CONFLICT DO NOTHING;
 
-INSERT INTO orders.products (sku, name, category, supplier_id, supplier_name, units_per_case, abv_pct) VALUES
-    ('SKU-SP-1001', 'Harbor Reserve Bourbon 750ml',          'SPIRITS', 'SUP-100', 'Copper Still Distillers', 12, 45.0),
-    ('SKU-SP-1002', 'Blue Agave Blanco Tequila 750ml',       'SPIRITS', 'SUP-100', 'Copper Still Distillers', 12, 40.0),
-    ('SKU-SP-1003', 'Copper Still Single Barrel Rye 750ml',  'SPIRITS', 'SUP-100', 'Copper Still Distillers',  6, 55.0),
-    ('SKU-WN-2001', 'Coastal Ridge Cabernet Sauvignon 750ml','WINE',    'SUP-200', 'Valley Crest Vineyards',  12, 13.5),
-    ('SKU-WN-2002', 'Coastal Ridge Chardonnay 750ml',        'WINE',    'SUP-200', 'Valley Crest Vineyards',  12, 13.0),
-    ('SKU-BR-3001', 'Gulf Coast Lager 12oz (24 pack)',       'BEER',    'SUP-300', 'Bayou Brewing Co.',       24,  4.8)
+INSERT INTO orders.suppliers (id, name) VALUES
+    ('SUP-DIAGEO',        'Diageo'),
+    ('SUP-WGS',           'William Grant & Sons'),
+    ('SUP-FIFTHGEN',      'Fifth Generation Inc.'),
+    ('SUP-BACARDI',       'Bacardi USA'),
+    ('SUP-JFW',           'Jackson Family Wines'),
+    ('SUP-DEUTSCH',       'Deutsch Family Wine & Spirits'),
+    ('SUP-CONSTELLATION', 'Constellation Brands'),
+    ('SUP-HEINEKEN',      'Heineken USA')
+ON CONFLICT DO NOTHING;
+
+-- supplier_cost_cents is 75% of the base case price.
+INSERT INTO orders.products (sku, name, brand, category, subcategory, supplier_id, units_per_case, unit_size, abv_pct, supplier_cost_cents) VALUES
+    ('SKU-SC-2001', 'Johnnie Walker Black Label 12 Year Blended Scotch', 'Johnnie Walker', 'SPIRITS', 'SCOTCH', 'SUP-DIAGEO',        12, '750ml', 40.0, 27900),
+    ('SKU-SC-2002', 'Johnnie Walker Red Label Blended Scotch',           'Johnnie Walker', 'SPIRITS', 'SCOTCH', 'SUP-DIAGEO',        12, '750ml', 40.0, 17100),
+    ('SKU-SC-2003', 'Glenfiddich 12 Year Single Malt Scotch',            'Glenfiddich',    'SPIRITS', 'SCOTCH', 'SUP-WGS',           12, '750ml', 40.0, 35100),
+    ('SKU-SC-2004', 'Johnnie Walker Blue Label Blended Scotch',          'Johnnie Walker', 'SPIRITS', 'SCOTCH', 'SUP-DIAGEO',         6, '750ml', 40.0, 81000),
+    ('SKU-VK-1001', 'Tito''s Handmade Vodka',                            'Tito''s',        'SPIRITS', 'VODKA',  'SUP-FIFTHGEN',      12, '750ml', 40.0, 17100),
+    ('SKU-VK-1002', 'Grey Goose Vodka',                                  'Grey Goose',     'SPIRITS', 'VODKA',  'SUP-BACARDI',       12, '750ml', 40.0, 25200),
+    ('SKU-VK-1003', 'Smirnoff No. 21 Vodka',                             'Smirnoff',       'SPIRITS', 'VODKA',  'SUP-DIAGEO',        12, '750ml', 40.0,  9900),
+    ('SKU-WN-3001', 'Kendall-Jackson Vintner''s Reserve Chardonnay',     'Kendall-Jackson','WINE',    'WINE',   'SUP-JFW',           12, '750ml', 13.5, 10350),
+    ('SKU-WN-3002', 'Josh Cellars Cabernet Sauvignon',                   'Josh Cellars',   'WINE',    'WINE',   'SUP-DEUTSCH',       12, '750ml', 13.5,  9450),
+    ('SKU-BR-4001', 'Corona Extra (24 x 12oz bottles)',                  'Corona',         'BEER',    'BEER',   'SUP-CONSTELLATION', 24, '12oz',   4.6,  2363),
+    ('SKU-BR-4002', 'Heineken (24 x 12oz bottles)',                      'Heineken',       'BEER',    'BEER',   'SUP-HEINEKEN',      24, '12oz',   5.0,  2475)
 ON CONFLICT DO NOTHING;
 
 -- Price per case = base price x state factor, for this month and next month.
 WITH base (sku, cents) AS (VALUES
-        ('SKU-SP-1001', 32400), ('SKU-SP-1002', 28800), ('SKU-SP-1003', 41400),
-        ('SKU-WN-2001', 16800), ('SKU-WN-2002', 14400), ('SKU-BR-3001', 2650)),
+        ('SKU-SC-2001', 37200), ('SKU-SC-2002', 22800), ('SKU-SC-2003', 46800), ('SKU-SC-2004', 108000),
+        ('SKU-VK-1001', 22800), ('SKU-VK-1002', 33600), ('SKU-VK-1003', 13200),
+        ('SKU-WN-3001', 13800), ('SKU-WN-3002', 12600), ('SKU-BR-4001', 3150), ('SKU-BR-4002', 3300)),
      factor (state, f) AS (VALUES ('FL', 1.00), ('TX', 0.98), ('NY', 1.06), ('CA', 1.02), ('GA', 1.00)),
      months (m) AS (VALUES (date_trunc('month', current_date)::date),
                            ((date_trunc('month', current_date) + interval '1 month')::date))

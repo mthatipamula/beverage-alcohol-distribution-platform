@@ -9,6 +9,7 @@ import { ensureTopics, kafka, newProducer, OutboxRelay, outboxBacklog } from './
 import { ApiError, applyEvent, UnknownOrderError } from './orders.js';
 import { catalogRoutes } from './routes/catalog.js';
 import { orderRoutes } from './routes/orders.js';
+import { purchasingRoutes } from './routes/purchasing.js';
 
 const app = Fastify({
   logger: { level: process.env.LOG_LEVEL ?? 'info', redact: ['req.headers.authorization', 'req.headers["x-api-key"]'] },
@@ -47,6 +48,7 @@ app.get('/health', { schema: { hide: true } }, async (_req, reply) => {
 
 await app.register(catalogRoutes);
 await app.register(orderRoutes);
+await app.register(purchasingRoutes);
 
 // ---- Startup: schema, topics, outbox relay, downstream event consumer ----
 await migrate(app.log);

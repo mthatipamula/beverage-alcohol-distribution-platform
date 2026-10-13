@@ -9,14 +9,22 @@ CREATE TABLE IF NOT EXISTS orders.accounts (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS orders.suppliers (
+    id   TEXT PRIMARY KEY,                 -- e.g. SUP-DIAGEO
+    name TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS orders.products (
-    sku            TEXT PRIMARY KEY,
-    name           TEXT    NOT NULL,
-    category       TEXT    NOT NULL CHECK (category IN ('BEER', 'WINE', 'SPIRITS')),
-    supplier_id    TEXT    NOT NULL,
-    supplier_name  TEXT    NOT NULL,
-    units_per_case INT     NOT NULL,
-    abv_pct        NUMERIC(4, 1) NOT NULL
+    sku                 TEXT PRIMARY KEY,
+    name                TEXT    NOT NULL,
+    brand               TEXT    NOT NULL,
+    category            TEXT    NOT NULL CHECK (category IN ('BEER', 'WINE', 'SPIRITS')),   -- drives licensing rules
+    subcategory         TEXT    NOT NULL,                                                   -- VODKA, SCOTCH, WINE, BEER
+    supplier_id         TEXT    NOT NULL REFERENCES orders.suppliers (id),
+    units_per_case      INT     NOT NULL,
+    unit_size           TEXT    NOT NULL,                                                   -- e.g. 750ml, 12oz
+    abv_pct             NUMERIC(4, 1) NOT NULL,
+    supplier_cost_cents BIGINT  NOT NULL CHECK (supplier_cost_cents > 0)                     -- what the distributor pays per case
 );
 
 -- Price per case for each state and month. In price-posting states these must match the posted prices.
@@ -90,4 +98,31 @@ CREATE TABLE IF NOT EXISTS orders.processed_events (
     event_id     UUID PRIMARY KEY,
     event_type   TEXT        NOT NULL,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Distributor purchase orders to suppliers. Receiving one publishes InventoryReceived (inventory.receipts),
+-- and the inventory service adds the cases to the warehouse's stock.
+CREATE TABLE IF NOT EXISTS orders.purchase_orders (
+    id               UUID PRIMARY KEY,
+    supplier_id      TEXT        NOT NULL REFERENCES orders.suppliers (id),
+    warehouse_id     TEXT        NOT NULL,
+    status           TEXT        NOT NULL CHECK (status IN ('SUBMITTED', 'RECEIVED', 'CANCELLED')),
+    expected_date    DATE        NOT NULL,
+    total_cost_cents BIGINT      NOT NULL,
+    idempotency_key  TEXT        NOT NULL UNIQUE,
+    created_by       TEXT        NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    received_by      TEXT,
+    received_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS ix_purchase_orders_created ON orders.purchase_orders (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS orders.purchase_order_lines (
+    purchase_order_id UUID   NOT NULL REFERENCES orders.purchase_orders (id),
+    line_no           INT    NOT NULL,
+    sku               TEXT   NOT NULL REFERENCES orders.products (sku),
+    quantity_cases    INT    NOT NULL CHECK (quantity_cases > 0),
+    unit_cost_cents   BIGINT NOT NULL,
+    line_total_cents  BIGINT NOT NULL,
+    PRIMARY KEY (purchase_order_id, line_no)
 );

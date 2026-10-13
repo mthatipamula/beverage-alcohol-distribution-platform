@@ -24,8 +24,9 @@ ON CONFLICT DO NOTHING;
 
 -- Posted prices for price-posting states (same base x state factor as the order API's price list).
 WITH base (sku, cents) AS (VALUES
-        ('SKU-SP-1001', 32400), ('SKU-SP-1002', 28800), ('SKU-SP-1003', 41400),
-        ('SKU-WN-2001', 16800), ('SKU-WN-2002', 14400), ('SKU-BR-3001', 2650)),
+        ('SKU-SC-2001', 37200), ('SKU-SC-2002', 22800), ('SKU-SC-2003', 46800), ('SKU-SC-2004', 108000),
+        ('SKU-VK-1001', 22800), ('SKU-VK-1002', 33600), ('SKU-VK-1003', 13200),
+        ('SKU-WN-3001', 13800), ('SKU-WN-3002', 12600), ('SKU-BR-4001', 3150), ('SKU-BR-4002', 3300)),
      factor (state, f) AS (VALUES ('NY', 1.06), ('GA', 1.00)),
      months (m) AS (VALUES (date_trunc('month', current_date)::date),
                            ((date_trunc('month', current_date) + interval '1 month')::date))

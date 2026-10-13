@@ -18,3 +18,4 @@ aws/deploy/.outputs.env
 .vscode/
 .DS_Store
 .claude/
+*.tsbuildinfo

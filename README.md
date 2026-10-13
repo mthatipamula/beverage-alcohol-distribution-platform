@@ -153,7 +153,7 @@ All deployment scripts are in [`aws/deploy`](aws/deploy) and use **CloudFormatio
 | Stack | Template | Contents |
 |---|---|---|
 | `bevdist-infra` | [`infra.yaml`](aws/deploy/cloudformation/infra.yaml) | VPC (2 AZs, no NAT gateway), RDS PostgreSQL, Amazon MSK (2 brokers, SASL/SCRAM over TLS), Cognito user pool and groups, ECS cluster, internal ALB, API Gateway HTTP API with JWT authorizer and VPC link, S3 feeds bucket, IAM roles |
-| `bevdist-services` | [`services.yaml`](aws/deploy/cloudformation/services.yaml) | Three ECS Fargate services on ARM64 (Graviton), target groups and routing rules, CloudWatch log groups |
+| `bevdist-services` | [`services.yaml`](aws/deploy/cloudformation/services.yaml) | Four ECS Fargate services on ARM64 (Graviton): the three backends and the web app (nginx), with target groups, routing rules and CloudWatch log groups |
 
 Secrets never appear in templates or scripts: the database password is generated and managed by RDS in
 Secrets Manager, the Kafka SCRAM credentials are generated into a KMS-encrypted secret, and ECS injects both
@@ -161,7 +161,7 @@ into the containers.
 
 ### 1. Set up the AWS account and CLI profile (once)
 
-The scripts only ever use the AWS CLI profile **`beverage-distributor`**. They stop if it's missing, if it
+The scripts only ever use the AWS CLI profile **`beverage-alcohol-distributor`**. They stop if it's missing, if it
 points at another account, or if `EXPECTED_ACCOUNT_ID` is set and doesn't match.
 
 1. Create a dedicated AWS account for this project, and turn on MFA for its root user.
@@ -170,13 +170,13 @@ points at another account, or if `EXPECTED_ACCOUNT_ID` is set and doesn't match.
 3. Configure the profile. With IAM Identity Center:
 
    ```bash
-   aws configure sso --profile beverage-distributor
+   aws configure sso --profile beverage-alcohol-distributor
    ```
 
    With an access key instead:
 
    ```bash
-   aws configure --profile beverage-distributor
+   aws configure --profile beverage-alcohol-distributor
    ```
 
 4. Put the account ID in `EXPECTED_ACCOUNT_ID` in [`aws/deploy/config.env`](aws/deploy/config.env).
@@ -187,16 +187,21 @@ Every script shows the account and asks before changing anything.
 
 ```bash
 ./aws/deploy/01-bootstrap.sh     # ECR repositories (once)
-./aws/deploy/02-build-push.sh    # build ARM64 images and push them
+./aws/deploy/02-build-push.sh    # build the four ARM64 images and push them
 ./aws/deploy/03-deploy.sh        # both stacks; the first run takes about 30 minutes (MSK)
 ./aws/deploy/status.sh
 ```
 
+The web app and the API share one URL (the `ApiUrl` printed by `03-deploy.sh`): the pages, `/docs` and
+`/health` are public, and everything under `/v1/` needs a Cognito token. The browser signs in to Cognito
+directly with email and password.
+
 Create users (the password is typed in, not passed as an argument):
 
 ```bash
-./aws/deploy/create-user.sh ops@example.com admin
-./aws/deploy/create-user.sh buyer@example.com retailer ACC-FL-1001
+./aws/deploy/create-user.sh ops@example.com admin                      # distributor operations
+./aws/deploy/create-user.sh rep@example.com sales_rep                  # sales rep
+./aws/deploy/create-user.sh buyer@example.com retailer ACC-FL-1001     # retail user (Bayside Liquors)
 ```
 
 Run the smoke test against AWS:
@@ -209,15 +214,15 @@ To deploy new code, run `02-build-push.sh` and then `03-deploy.sh`.
 
 ### Cost and teardown
 
-Roughly **$130–140 a month** in us-east-1 while running:
+Roughly **$140–150 a month** in us-east-1 while running:
 
 | Item | Monthly |
 |---|---|
 | MSK (2 × kafka.t3.small) | about $70 |
 | RDS db.t4g.micro | about $15 |
-| Fargate (3 small ARM tasks) | about $22 |
+| Fargate (4 small ARM tasks) | about $29 |
 | ALB | about $16 |
-| Public IPv4 addresses | about $11 |
+| Public IPv4 addresses | about $15 |
 | Secrets, KMS, logs, API Gateway | a few dollars |
 
 Delete everything when you're not using it:

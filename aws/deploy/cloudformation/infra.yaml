@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Beverage Alcohol Distribution Platform - shared infrastructure: VPC, RDS PostgreSQL, Amazon MSK (Kafka),
-  Cognito, ECS cluster, internal Application Load Balancer, API Gateway HTTP API and the depletion feeds bucket.
+  Cognito, ECS cluster, internal Application Load Balancer, API Gateway HTTP API (web app and API) and the
+  depletion feeds bucket.
 
 Parameters:
   ProjectName:
@@ -302,26 +303,27 @@ Resources:
       JwtConfiguration:
         Audience: [!Ref UserPoolClient]
         Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
-  ProxyRoute:
+  # API calls need a Cognito token; the web app's pages, /docs and /health are public.
+  ApiRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref HttpApi
-      RouteKey: "ANY /{proxy+}"
+      RouteKey: "ANY /v1/{proxy+}"
       AuthorizationType: JWT
       AuthorizerId: !Ref JwtAuthorizer
       Target: !Sub "integrations/${Integration}"
-  HealthRoute:
+  PublicRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref HttpApi
-      RouteKey: "GET /health"
+      RouteKey: "GET /{proxy+}"
       AuthorizationType: NONE
       Target: !Sub "integrations/${Integration}"
-  DocsRoute:
+  RootRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref HttpApi
-      RouteKey: "GET /docs/{proxy+}"
+      RouteKey: "GET /"
       AuthorizationType: NONE
       Target: !Sub "integrations/${Integration}"
   Stage:

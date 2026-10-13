@@ -32,12 +32,26 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
     },
   }, async (req) => {
     const { rows } = await pool.query(
-      `SELECT p.sku, p.name, p.category, p.supplier_id AS "supplierId", p.supplier_name AS "supplierName",
-              p.units_per_case AS "unitsPerCase", p.abv_pct::float AS "abvPct",
+      `SELECT p.sku, p.name, p.brand, p.category, p.subcategory, p.supplier_id AS "supplierId",
+              s.name AS "supplierName", p.units_per_case AS "unitsPerCase", p.unit_size AS "unitSize",
+              p.abv_pct::float AS "abvPct",
               (SELECT pp.price_per_case_cents FROM orders.product_prices pp
                WHERE pp.sku = p.sku AND pp.state = $1 AND pp.effective_month <= current_date
                ORDER BY pp.effective_month DESC LIMIT 1) AS "pricePerCaseCents"
-       FROM orders.products p ORDER BY p.sku`, [req.query.state]);
+       FROM orders.products p JOIN orders.suppliers s ON s.id = p.supplier_id
+       ORDER BY p.subcategory, p.brand, p.sku`, [req.query.state]);
     return rows.filter((r) => r.pricePerCaseCents != null);
   });
+
+  app.get('/v1/suppliers', { schema: { tags: ['purchasing'], summary: 'Suppliers with their products and case costs' } },
+    async (req, reply) => {
+      if (!hasRole(req.principal, 'admin')) return reply.code(403).send(problem(403, 'FORBIDDEN', 'Distributor staff only'));
+      const { rows } = await pool.query(
+        `SELECT s.id, s.name,
+                json_agg(json_build_object('sku', p.sku, 'name', p.name, 'subcategory', p.subcategory,
+                         'unitsPerCase', p.units_per_case, 'supplierCostCents', p.supplier_cost_cents) ORDER BY p.sku) AS products
+         FROM orders.suppliers s JOIN orders.products p ON p.supplier_id = s.id
+         GROUP BY s.id, s.name ORDER BY s.name`);
+      return rows;
+    });
 }

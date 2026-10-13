@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time: ECR repositories for the three service images (scan on push, keep the last 10 images).
+# One-time: ECR repositories for the four images (three services and the web app) (scan on push, keep the last 10 images).
 source "$(dirname "$0")/common.sh"
 confirm_account "Create ECR repositories"
 for svc in $SERVICES; do

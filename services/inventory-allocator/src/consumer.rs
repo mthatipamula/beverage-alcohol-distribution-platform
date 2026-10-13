@@ -1,4 +1,6 @@
-//! Kafka consumer for OrderValidated: reserves stock and publishes InventoryReserved or InventoryFailed.
+//! Kafka consumer for two topics:
+//! - orders.validated: reserves stock and publishes InventoryReserved or InventoryFailed;
+//! - inventory.receipts: adds received purchase-order cases to a warehouse's stock.
 //!
 //! Delivery is at least once. Each order's outcome is stored with the event that was published, so a
 //! redelivered message re-sends the same event (same eventId) instead of reserving stock twice. Offsets are
@@ -27,6 +29,7 @@ use crate::{
 pub const TOPIC_VALIDATED: &str = "orders.validated";
 pub const TOPIC_RESERVED: &str = "inventory.reserved";
 pub const TOPIC_FAILED: &str = "inventory.failed";
+pub const TOPIC_RECEIPTS: &str = "inventory.receipts";
 pub const TOPIC_DLQ: &str = "inventory-allocator.dlq";
 const MAX_ATTEMPTS: u32 = 5;
 const EVENT_NAMESPACE: Uuid = Uuid::from_u128(0x6a1f_3c2e_8d4b_4f7a_9b0c_2e5d_7f81_a3c4);
@@ -45,6 +48,44 @@ struct ValidatedOrder {
     state: String,
     lines: Vec<Line>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReceiptEnvelope {
+    payload: Receipt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Receipt {
+    purchase_order_id: Uuid,
+    warehouse_id: String,
+    lines: Vec<ReceiptLine>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReceiptLine {
+    sku: String,
+    quantity_cases: i64,
+}
+
+enum Incoming {
+    Order(Envelope),
+    Receipt(ReceiptEnvelope),
+}
+
+/// A failure that retrying cannot fix (e.g. an unknown warehouse): dead-lettered at once.
+#[derive(Debug)]
+struct Permanent(String);
+
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Permanent {}
 
 fn client_config(cfg: &Config) -> ClientConfig {
     let mut c = ClientConfig::new();
@@ -69,8 +110,8 @@ pub async fn run(cfg: Config, pool: Pool, producer: FutureProducer) -> anyhow::R
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .create()?;
-    consumer.subscribe(&[TOPIC_VALIDATED])?;
-    tracing::info!(topic = TOPIC_VALIDATED, "Consuming");
+    consumer.subscribe(&[TOPIC_VALIDATED, TOPIC_RECEIPTS])?;
+    tracing::info!(topics = ?[TOPIC_VALIDATED, TOPIC_RECEIPTS], "Consuming");
 
     loop {
         // Broker errors (e.g. the topic not created yet at first deploy) are logged, not fatal.
@@ -83,20 +124,28 @@ pub async fn run(cfg: Config, pool: Pool, producer: FutureProducer) -> anyhow::R
             }
         };
         let raw = msg.payload().unwrap_or_default();
-        match serde_json::from_slice::<Envelope>(raw) {
+        let parsed = match msg.topic() {
+            TOPIC_RECEIPTS => serde_json::from_slice(raw).map(Incoming::Receipt),
+            _ => serde_json::from_slice(raw).map(Incoming::Order),
+        };
+        match parsed {
             Err(err) => dead_letter(&producer, msg.topic(), raw, &format!("unparseable event: {err}")).await?,
-            Ok(event) => {
+            Ok(incoming) => {
                 let mut attempt = 1;
                 loop {
-                    match handle(&pool, &producer, &event).await {
+                    let result = match &incoming {
+                        Incoming::Order(event) => handle(&pool, &producer, event).await,
+                        Incoming::Receipt(event) => handle_receipt(&pool, &event.payload).await,
+                    };
+                    match result {
                         Ok(()) => break,
-                        Err(err) if attempt >= MAX_ATTEMPTS => {
-                            tracing::error!(order_id = %event.order_id, error = %err, "Giving up; dead-lettering");
+                        Err(err) if attempt >= MAX_ATTEMPTS || err.downcast_ref::<Permanent>().is_some() => {
+                            tracing::error!(topic = msg.topic(), error = %err, "Giving up; dead-lettering");
                             dead_letter(&producer, msg.topic(), raw, &format!("{err:#}")).await?;
                             break;
                         }
                         Err(err) => {
-                            tracing::warn!(order_id = %event.order_id, attempt, error = %err, "Retrying");
+                            tracing::warn!(topic = msg.topic(), attempt, error = %err, "Retrying");
                             tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
                             attempt += 1;
                         }
@@ -106,6 +155,41 @@ pub async fn run(cfg: Config, pool: Pool, producer: FutureProducer) -> anyhow::R
         }
         consumer.commit_message(&msg, CommitMode::Async)?;
     }
+}
+
+/// Adds received cases to the warehouse, once per purchase order.
+async fn handle_receipt(pool: &Pool, receipt: &Receipt) -> anyhow::Result<()> {
+    let mut client = pool.get().await.context("database connection")?;
+    let tx = client.transaction().await?;
+    let known = tx
+        .query_opt("SELECT 1 FROM inventory.warehouses WHERE id = $1", &[&receipt.warehouse_id])
+        .await?;
+    if known.is_none() {
+        return Err(Permanent(format!("unknown warehouse {}", receipt.warehouse_id)).into());
+    }
+    let cases: i64 = receipt.lines.iter().map(|l| l.quantity_cases).sum();
+    let inserted = tx
+        .execute(
+            "INSERT INTO inventory.receipts (purchase_order_id, warehouse_id, cases) VALUES ($1, $2, $3)
+             ON CONFLICT (purchase_order_id) DO NOTHING",
+            &[&receipt.purchase_order_id, &receipt.warehouse_id, &cases],
+        )
+        .await?;
+    if inserted == 0 {
+        tracing::info!(purchase_order_id = %receipt.purchase_order_id, "Receipt already applied");
+        return Ok(());
+    }
+    for line in &receipt.lines {
+        tx.execute(
+            "INSERT INTO inventory.stock (warehouse_id, sku, on_hand_cases) VALUES ($1, $2, $3)
+             ON CONFLICT (warehouse_id, sku) DO UPDATE SET on_hand_cases = inventory.stock.on_hand_cases + EXCLUDED.on_hand_cases",
+            &[&receipt.warehouse_id, &line.sku, &line.quantity_cases],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(purchase_order_id = %receipt.purchase_order_id, warehouse = %receipt.warehouse_id, cases, "Stock received");
+    Ok(())
 }
 
 async fn handle(pool: &Pool, producer: &FutureProducer, event: &Envelope) -> anyhow::Result<()> {
