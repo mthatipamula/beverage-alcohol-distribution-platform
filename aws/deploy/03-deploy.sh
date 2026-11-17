@@ -21,6 +21,7 @@ aws cloudformation deploy --stack-name "$SERVICES_STACK" --template-file "$HERE/
 API_URL=$(stack_output "$INFRA_STACK" ApiUrl)
 log "Deployed: $API_URL"
 cat <<MSG
+  Web app:      $API_URL   (sign in with a Cognito user; create one below)
   Health:       curl $API_URL/health
   Create users: ./aws/deploy/create-user.sh you@example.com admin
   Smoke test:   BASE_URL=$API_URL TOKEN=\$(./aws/deploy/get-token.sh you@example.com) ./scripts/smoke-test.sh

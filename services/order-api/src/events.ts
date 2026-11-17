@@ -8,6 +8,7 @@ export const Topics = {
   inventoryReserved: 'inventory.reserved',
   inventoryFailed: 'inventory.failed',
   orderConfirmed: 'orders.confirmed',
+  inventoryReceipts: 'inventory.receipts',
   orderApiDlq: 'order-api.dlq',
   complianceDlq: 'compliance-service.dlq',
   allocatorDlq: 'inventory-allocator.dlq',

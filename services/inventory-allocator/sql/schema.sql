@@ -33,3 +33,11 @@ CREATE TABLE IF NOT EXISTS inventory.allocation_lines (
     quantity_cases BIGINT NOT NULL,
     PRIMARY KEY (order_id, line_no, warehouse_id)
 );
+
+-- Purchase-order receipts already applied (Kafka delivers at least once, so each is applied once).
+CREATE TABLE IF NOT EXISTS inventory.receipts (
+    purchase_order_id UUID PRIMARY KEY,
+    warehouse_id      TEXT        NOT NULL REFERENCES inventory.warehouses (id),
+    cases             BIGINT      NOT NULL,
+    received_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);

@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Beverage Alcohol Distribution Platform - ECS Fargate services (order-api, compliance-service,
-  inventory-allocator) behind the internal load balancer from the infrastructure stack.
+  inventory-allocator, web) behind the internal load balancer from the infrastructure stack.
 
 Parameters:
   InfraStackName:
@@ -22,6 +22,9 @@ Parameters:
   DesiredCount:
     Type: Number
     Default: 1
+  BrandName:
+    Type: String
+    Default: BevDist Wholesale
 
 Resources:
   # ---------------------------------------------------------------- order-api (Node.js)
@@ -79,7 +82,7 @@ Resources:
     Properties:
       ListenerArn: { "Fn::ImportValue": !Sub "${InfraStackName}-Listener" }
       Priority: 100
-      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/*"] } }]
+      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/v1/*", "/docs", "/docs/*", "/health"] } }]
       Actions: [{ Type: forward, TargetGroupArn: !Ref OrderApiTargets }]
   OrderApiService:
     Type: AWS::ECS::Service
@@ -246,3 +249,66 @@ Resources:
           Subnets: !Split [",", { "Fn::ImportValue": !Sub "${InfraStackName}-PublicSubnets" }]
           SecurityGroups: [{ "Fn::ImportValue": !Sub "${InfraStackName}-ServiceSecurityGroup" }]
       LoadBalancers: [{ ContainerName: inventory-allocator, ContainerPort: 8080, TargetGroupArn: !Ref AllocatorTargets }]
+
+  # ---------------------------------------------------------------- web (React app served by nginx)
+  WebLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /bevdist/web, RetentionInDays: 14 }
+  WebTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: bevdist-web
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${InfraStackName}-ExecutionRole" }
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub "${ImageRegistry}/web:${ImageTag}"
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080 }]
+          Environment:   # written to /config.json for the browser; no secrets (public Cognito app client)
+            - { Name: AUTH_MODE, Value: cognito }
+            - { Name: BRAND_NAME, Value: !Ref BrandName }
+            - { Name: COGNITO_REGION, Value: !Ref AWS::Region }
+            - { Name: COGNITO_CLIENT_ID, Value: { "Fn::ImportValue": !Sub "${InfraStackName}-UserPoolClient" } }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref WebLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: web }
+  WebTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: { "Fn::ImportValue": !Sub "${InfraStackName}-VpcId" }
+      HealthCheckPath: /health
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "15" }]
+  WebRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: { "Fn::ImportValue": !Sub "${InfraStackName}-Listener" }
+      Priority: 200
+      Conditions: [{ Field: path-pattern, PathPatternConfig: { Values: ["/*"] } }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref WebTargets }]
+  WebService:
+    Type: AWS::ECS::Service
+    DependsOn: WebRule
+    Properties:
+      ServiceName: web
+      Cluster: { "Fn::ImportValue": !Sub "${InfraStackName}-Cluster" }
+      TaskDefinition: !Ref WebTask
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${InfraStackName}-PublicSubnets" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${InfraStackName}-ServiceSecurityGroup" }]
+      LoadBalancers: [{ ContainerName: web, ContainerPort: 8080, TargetGroupArn: !Ref WebTargets }]

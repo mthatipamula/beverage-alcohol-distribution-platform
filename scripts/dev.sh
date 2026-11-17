@@ -27,7 +27,8 @@ case "${1:-start}" in
     docker compose ps --format 'table {{.Service}}\t{{.Status}}'
     cat <<MSG
 
-API (gateway):     http://localhost:8090        OpenAPI: http://localhost:8090/docs
+Web app:           http://localhost:8090        (pick Retailer, Sales rep or Distributor operations)
+API docs:          http://localhost:8090/docs
 Compliance docs:   http://localhost:8091/docs
 API keys:          local-admin-key | local-rep-key | local-retailer-key (account ACC-FL-1001)
 Depletion feeds:   ./data/feeds

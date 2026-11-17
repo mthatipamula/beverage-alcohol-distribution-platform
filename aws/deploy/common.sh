@@ -12,8 +12,8 @@ log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 if ! aws configure list-profiles 2>/dev/null | grep -qx "$AWS_PROFILE"; then
   cat >&2 <<MSG
-AWS CLI profile "$AWS_PROFILE" does not exist. Create the beverage-distributor AWS account and an
-administrator user (or IAM Identity Center access) for it, then configure the profile:
+AWS CLI profile "$AWS_PROFILE" does not exist. Create an administrator user (or IAM Identity Center
+access) in the project's AWS account, then configure the profile:
   aws configure --profile $AWS_PROFILE          # access key, or:
   aws configure sso --profile $AWS_PROFILE      # IAM Identity Center
 See the README section "Deploy to AWS".
@@ -29,7 +29,7 @@ if [ -n "$EXPECTED_ACCOUNT_ID" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ];
 fi
 for forbidden in $FORBIDDEN_ACCOUNT_IDS; do
   if [ "$ACCOUNT_ID" = "$forbidden" ]; then
-    echo "Profile $AWS_PROFILE points at account $ACCOUNT_ID, which is not the beverage-distributor account. Stopping." >&2
+    echo "Profile $AWS_PROFILE points at account $ACCOUNT_ID, which is on the forbidden list in config.env. Stopping." >&2
     exit 1
   fi
 done

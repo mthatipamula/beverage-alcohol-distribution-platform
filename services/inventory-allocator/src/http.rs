@@ -17,10 +17,15 @@ pub struct AppState {
     pub auth_mode: String,
 }
 
-const API_KEYS: [&str; 2] = ["local-admin-key", "local-rep-key"];
+// Retail users may read availability (shown in the catalog); stock is never changed over HTTP.
+const API_KEYS: [&str; 3] = ["local-admin-key", "local-rep-key", "local-retailer-key"];
 
 pub fn router(state: AppState) -> Router {
-    Router::new().route("/health", get(health)).route("/v1/inventory", get(inventory)).with_state(state)
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/inventory", get(inventory))
+        .route("/v1/inventory/warehouses", get(warehouses))
+        .with_state(state)
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -32,7 +37,7 @@ async fn health(State(state): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 struct InventoryQuery {
-    state: String,
+    state: Option<String>,
     sku: Option<String>,
 }
 
@@ -47,17 +52,17 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
 
 async fn inventory(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<InventoryQuery>) -> Response {
     if !authorized(&state, &headers) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "status": 401, "detail": "Admin or sales rep credentials required" })))
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "status": 401, "detail": "Valid credentials required" })))
             .into_response();
     }
     let result = async {
         let client = state.pool.get().await?;
         let rows = client
             .query(
-                "SELECT w.id, w.name, s.sku, s.on_hand_cases, s.reserved_cases
+                "SELECT w.id, w.name, s.sku, s.on_hand_cases, s.reserved_cases, w.state
                  FROM inventory.stock s JOIN inventory.warehouses w ON w.id = s.warehouse_id
-                 WHERE w.state = $1 AND ($2::text IS NULL OR s.sku = $2)
-                 ORDER BY w.priority, w.id, s.sku",
+                 WHERE ($1::text IS NULL OR w.state = $1) AND ($2::text IS NULL OR s.sku = $2)
+                 ORDER BY w.state, w.priority, w.id, s.sku",
                 &[&q.state, &q.sku],
             )
             .await?;
@@ -66,6 +71,7 @@ async fn inventory(State(state): State<AppState>, headers: HeaderMap, Query(q): 
                 .map(|r| {
                     let (on_hand, reserved): (i64, i64) = (r.get(3), r.get(4));
                     json!({ "warehouseId": r.get::<_, String>(0), "warehouse": r.get::<_, String>(1),
+                            "state": r.get::<_, String>(5),
                             "sku": r.get::<_, String>(2), "onHandCases": on_hand, "reservedCases": reserved,
                             "availableCases": on_hand - reserved })
                 })
@@ -77,6 +83,30 @@ async fn inventory(State(state): State<AppState>, headers: HeaderMap, Query(q): 
         Ok(items) => Json(items).into_response(),
         Err(err) => {
             tracing::error!(error = %err, "Inventory query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "status": 500 }))).into_response()
+        }
+    }
+}
+
+async fn warehouses(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "status": 401 }))).into_response();
+    }
+    let result = async {
+        let client = state.pool.get().await?;
+        let rows = client.query("SELECT id, name, state, priority FROM inventory.warehouses ORDER BY state, priority", &[]).await?;
+        anyhow::Ok(
+            rows.iter()
+                .map(|r| json!({ "id": r.get::<_, String>(0), "name": r.get::<_, String>(1),
+                                 "state": r.get::<_, String>(2), "priority": r.get::<_, i32>(3) }))
+                .collect::<Vec<_>>(),
+        )
+    }
+    .await;
+    match result {
+        Ok(items) => Json(items).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "Warehouse query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "status": 500 }))).into_response()
         }
     }
