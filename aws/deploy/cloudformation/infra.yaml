@@ -17,7 +17,7 @@ Parameters:
     Default: kafka.t3.small
   KafkaVersion:
     Type: String
-    Default: 3.6.0
+    Default: 3.9.x   # MSK no longer accepts 3.6.0 on standard brokers
 
 Resources:
   # ---------------------------------------------------------------- Network
